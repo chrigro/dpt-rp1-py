@@ -12,17 +12,19 @@ from Crypto.Hash.HMAC import HMAC
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 import uuid
+import functools
 #from diffiehellman.diffiehellman import DiffieHellman
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
 class DigitalPaper():
     def __init__(self, addr = None):
+
         if addr is None:
             self.addr = "digitalpaper.local"
         else:
             self.addr = addr
+
         self.cookies = {}
 
     @property
@@ -56,11 +58,7 @@ class DigitalPaper():
         register_cleanup_url = '{base_url}/register/cleanup'.format(base_url = reg_url)
 
         print("Cleaning up...")
-        try:
-            r = requests.put(register_cleanup_url, verify = False)
-        except requests.exceptions.ConnectionError as e:
-            print('ERROR: Could not connect to DPT-RP1 under address {}'.format(self.base_url))
-            return None
+        r = requests.put(register_cleanup_url, verify = False)
         print(r)
 
         print("Requesting PIN...")
@@ -109,7 +107,7 @@ class DigitalPaper():
 
         if(base64.b64decode(m3['a']) != n2):
             print("Nonce N2 doesn't match")
-            return None
+            return
 
         eHash = base64.b64decode(m3['b'])
         m3hmac = base64.b64decode(m3['e'])
@@ -117,7 +115,7 @@ class DigitalPaper():
         hmac.update(n1 + n2 + mac + ya + m2hmac + n2 + eHash)
         if m3hmac != hmac.digest():
             print("M3 HMAC doesn't match")
-            return None
+            return
 
         pin = input("Please enter the PIN shown on the DPT-RP1: ")
 
@@ -149,7 +147,7 @@ class DigitalPaper():
 
         if(base64.b64decode(m5['a']) != n2):
             print("Nonce N2 doesn't match")
-            return None
+            return
 
         wrappedEsCert = base64.b64decode(m5['d'])
         m5hmac = base64.b64decode(m5['e'])
@@ -158,7 +156,7 @@ class DigitalPaper():
         hmac.update(n1 + rHash + wrappedRs + m4hmac + n2 + wrappedEsCert)
         if hmac.digest() != m5hmac:
             print("HMAC doesn't match!")
-            return None
+            return
 
         esCert = unwrap(wrappedEsCert, authKey, keyWrapKey)
         es = esCert[:16]
@@ -168,7 +166,7 @@ class DigitalPaper():
         hmac.update(es + psk + yb + ya)
         if hmac.digest() != eHash:
             print("eHash does not match!")
-            return None
+            return
 
         #print("Certificate: ")
         #print(cert)
@@ -213,173 +211,89 @@ class DigitalPaper():
     def authenticate(self, client_id, key):
         sig_maker = httpsig.Signer(secret=key, algorithm='rsa-sha256')
         nonce = self._get_nonce(client_id)
-        if nonce is not None:
-            signed_nonce = sig_maker._sign(nonce)
-            url = "{base_url}/auth".format(base_url = self.base_url)
-            data = {
-                "client_id": client_id,
-                "nonce_signed": signed_nonce
-            }
-            r = requests.put(url, json=data, verify=False)
-            _, credentials = r.headers["Set-Cookie"].split("; ")[0].split("=")
-            self.cookies["Credentials"] = credentials
-            return True
-        else:
-            return False
+        signed_nonce = sig_maker.sign(nonce)
+        url = "{base_url}/auth".format(base_url = self.base_url)
+        data = {
+            "client_id": client_id,
+            "nonce_signed": signed_nonce
+        }
+        r = requests.put(url, json=data, verify=False)
+        _, credentials = r.headers["Set-Cookie"].split("; ")[0].split("=")
+        self.cookies["Credentials"] = credentials
 
     ### File management
 
     def list_documents(self):
-        data = self._get_endpoint('/documents2')
-        if data is not None:
-            return data.json()['entry_list']
-        else:
-            return None
+        data = self._get_endpoint('/documents2').json()
+        return data['entry_list']
 
     def list_all(self):
-        data = self._get_endpoint('/documents2?entry_type=all')
-        if data is not None:
-            return data.json()['entry_list']
-        else:
-            return None
+        data = self._get_endpoint('/documents2?entry_type=all').json()
+        return data['entry_list']
 
-    def _check_remote_path(self, remote_path):
-        """Check if remote path starts with Document/
+    def list_objects_in_folder(self, remote_path):
+        remote_id = self._resolve_object_by_path(remote_path).json()['entry_id']
+        response = self._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = remote_id))
+        return response.json()['entry_list']
 
-        """
-        if not remote_path.startswith('Document'):
-            print('ERROR: Remote path MUST start with "Document".')
-
-    def _get_entry_id(self, remote_path, printerr=True):
-        self._check_remote_path(remote_path)
-        encoded_remote_path = quote_plus(remote_path)
-        url = "/resolve/entry/path/{enc_path}".format(enc_path = encoded_remote_path)
-        remote_entry = self._get_endpoint(url, printerr)
-        if remote_entry is not None:
-            remote_id = remote_entry.json()['entry_id']
-            return remote_id
-        else:
-            return None
+    def traverse_folder(self, remote_path):
+        def traverse(obj):
+            if obj['entry_type'] == 'document':
+                return [obj]
+            else:
+                children = self \
+                  ._get_endpoint("/folders/{remote_id}/entries2".format(remote_id = obj['entry_id'])) \
+                  .json()['entry_list']
+                return [obj] + functools.reduce(lambda acc, c: traverse(c) + acc, children[::-1], [])
+        return traverse(self._resolve_object_by_path(remote_path).json())
 
     def download(self, remote_path):
-        remote_id = self._get_entry_id(remote_path)
-        if remote_id is not None:
-            url = "{base_url}/documents/{remote_id}/file".format(
-                    base_url = self.base_url,
-                    remote_id = remote_id)
-            response = requests.get(url, verify=False, cookies=self.cookies)
-            return response.content
-        else:
-            print('ERROR: Remote file {} not found. Download failed.'.format(remote_path))
+        remote_id = self._resolve_object_by_path(remote_path).json()['entry_id']
+
+        url = "{base_url}/documents/{remote_id}/file".format(
+                base_url = self.base_url,
+                remote_id = remote_id)
+        response = requests.get(url, verify=False, cookies=self.cookies)
+        return response.content
 
     def delete_document(self, remote_path):
-        remote_id = self._get_entry_id(remote_path)
-        if remote_id is not None:
-            url = "/documents/{remote_id}".format(remote_id = remote_id)
-            self._delete_endpoint(url)
-        else:
-            print('ERROR: Remote file {} not found. Delete failed.'.format(remote_path))
+        remote_id = self._resolve_object_by_path(remote_path).json()['entry_id']
+        url = "/documents/{remote_id}".format(remote_id = remote_id)
+        self._delete_endpoint(url)
 
     def upload(self, fh, remote_path):
         filename = os.path.basename(remote_path)
         remote_directory = os.path.dirname(remote_path)
-        remote_dir_id = self._get_entry_id(remote_directory)
-        if remote_dir_id is not None:
-            info = {
-                "file_name": filename,
-                "parent_folder_id": remote_dir_id,
-                "document_source": ""
-            }
-            r = self._post_endpoint("/documents2", data=info)
-            doc = r.json()
-            doc_id = doc["document_id"]
-            doc_url = "/documents/{doc_id}/file".format(doc_id = doc_id)
-            files = {
-                'file': (filename, fh, 'rb')
-            }
-            self._put_endpoint(doc_url, files=files)
-        else:
-            print('ERROR: Remote directory {} not found. Upload failed.'.format(remote_directory))
+
+        directory_id = self._resolve_object_by_path(remote_directory).json()['entry_id']
+        info = {
+            "file_name": filename,
+            "parent_folder_id": directory_id,
+            "document_source": ""
+        }
+        r = self._post_endpoint("/documents2", data=info)
+        doc = r.json()
+        doc_id = doc["document_id"]
+        doc_url = "/documents/{doc_id}/file".format(doc_id = doc_id)
+
+        files = {
+            'file': (quote_plus(filename), fh, 'rb')
+        }
+        self._put_endpoint(doc_url, files=files)
 
     def new_folder(self, remote_path):
-        # first check if the folder exists
-        entry_id = self._get_entry_id(remote_path, printerr=False)
-        if entry_id is None:
-            folder_name = os.path.basename(remote_path)
-            remote_directory = os.path.dirname(remote_path)
-            remote_dir_id = self._get_entry_id(remote_directory)
-            if remote_dir_id is not None:
-                info = {
-                    "folder_name": folder_name,
-                    "parent_folder_id": remote_dir_id
-                }
-                r = self._post_endpoint("/folders2", data=info)
-            else:
-                print('ERROR: Remote parent directory {} not found. Upload failed.'.format(remote_directory))
-        else:
-            print('ERROR: Remote directory {} already exists.'.format(remote_directory))
+        folder_name = os.path.basename(remote_path)
+        remote_directory = os.path.dirname(remote_path)
 
-    def get_directory_contents(self, remote_path):
-        entry_id = self._get_entry_id(remote_path)
-        if entry_id is not None:
-            data = self._get_endpoint('/folders/{}/entries2'.format(entry_id)).json()
-            return data
-        else:
-            print('ERROR: Remote directory {} not found. Cannot get contents.'.format(remote_path))
-            return None
+        directory_id = self._resolve_object_by_path(remote_directory).json()['entry_id']
+        info = {
+            "folder_name": folder_name,
+            "parent_folder_id": directory_id
+        }
 
-    def delete_directory(self, remote_path):
-        dir_cont = self.get_directory_contents(remote_path)
-        if dir_cont is not None:
-            if dir_cont['count'] == 0:
-                entry_id = self._get_entry_id(remote_path)
-                self._delete_endpoint('/folders/{}'.format(entry_id))
-            else:
-                print('ERROR: Remote directory {} not empty. Cannot delete it.'.format(remote_path))
-
-    ### Templates
-
-    def list_templates(self):
-        data = self._get_endpoint('/viewer/configs/note_templates').json()
-        return(data)
-
-    def _get_template_id(self, name):
-        tmp_list = self.list_templates()
-        tmp_id = None
-        for template in tmp_list['template_list']:
-            if template['template_name'] == name:
-                tmp_id = template['note_template_id']
-        if tmp_id is None:
-            print('ERROR: No template with name {} found.'.format(name))
-        return tmp_id
-
-    def rename_template(self, old_name, new_name):
-        tid = self._get_template_id(old_name)
-        if tid is not None:
-            url = '/viewer/configs/note_templates/{}'.format(tid)
-            self._put_endpoint(url, data={'template_name': new_name})
-
-    def delete_template(self, name):
-        tid = self._get_template_id(name)
-        if tid is not None:
-            url = '/viewer/configs/note_templates/{}'.format(tid)
-            self._delete_endpoint(url)
-
-    def add_template(self, name, file_handle):
-        url = '/viewer/configs/note_templates'
-        res = self._post_endpoint(url, data={'template_name': name}).json()
-        if not 'error_code' in res:
-            tid = res['note_template_id']
-            url = '/viewer/configs/note_templates/{}/file'.format(tid)
-            files = {
-                'file': (name+'.pdf', file_handle, 'rb')
-            }
-            self._put_endpoint(url, files=files)
-        else:
-            print('ERROR: Adding template failed: {}'.format(res['message']))
+        r = self._post_endpoint("/folders2", data=info)
 
     ### Wifi
-
     def wifi_list(self):
         data = self._get_endpoint('/system/configs/wifi_accesspoints').json()
         for ap in data['aplist']:
@@ -394,6 +308,7 @@ class DigitalPaper():
 
     def configure_wifi(self, ssid, security, passwd, dhcp, static_address,
                        gateway, network_mask, dns1, dns2, proxy):
+
         #    cnf = {
         #        "ssid": base64.b64encode(b'YYY').decode('utf-8'),
         #        "security": "nonsec", # psk, nonsec, XXX
@@ -406,6 +321,7 @@ class DigitalPaper():
         #        "dns2": "",
         #        "proxy": "false"
         #    }
+
         #print(kwargs['ssid'])
         conf = dict(ssid = base64.b64encode(ssid.encode()).decode('utf-8'),
                     security = security,
@@ -417,6 +333,7 @@ class DigitalPaper():
                     dns1 = dns1,
                     dns2 = dns2,
                     proxy = proxy)
+
         return self._put_endpoint('/system/controls/wifi_accesspoints/register', data=conf)
 
     def delete_wifi(self, ssid, security):
@@ -502,20 +419,44 @@ class DigitalPaper():
         r = requests.get(url, verify=False, cookies=self.cookies)
         return r.content
 
+
+    ## Update firmware
+
+    def update_firmware(self, fwfh):
+        filename = 'FwUpdater.pkg'
+        fw_url = "/system/controls/update_firmware/file"\
+            .format(base_url=self.base_url)
+        files = {
+            'file': (quote_plus(filename), fwfh, 'rb')
+        }
+        # TODO: add file transferring feedback
+        self._put_endpoint(fw_url, files=files)
+
+        precheck_msg = self._get_endpoint(
+            '/system/controls/update_firmware/precheck').json()
+        battery_check = precheck_msg.get('battery', 'not ok')
+        uploaded_image_check = precheck_msg.get('image_file', 'not ok')
+
+        print('* battery check: {}'.format(battery_check))
+        print('* uploaded image check: {}'.format(uploaded_image_check))
+
+        for key in precheck_msg:
+            if not (key == 'battery' or key == 'image_file'):
+                print('! Find unrecognized key-value pair: ({0}, {1})'
+                      .format(key, precheck_msg[key]))
+
+        if battery_check == 'ok' and uploaded_image_check == 'ok':
+            # TODO: add check if status is 204
+            self._put_endpoint('/system/controls/update_firmware')
+
+
     ### Utility
 
-    def _get_endpoint(self, endpoint="", printerr=True):
+    def _get_endpoint(self, endpoint=""):
         url = "{base_url}{endpoint}" \
                 .format(base_url = self.base_url,
                         endpoint = endpoint)
-        res = requests.get(url, verify=False, cookies=self.cookies)
-        resjson = res.json()
-        if 'error_code' in resjson:
-            if printerr:
-                print('ERROR in getting endpoint {}: {}'.format(url ,resjson['message']))
-            return None
-        else:
-            return res
+        return requests.get(url, verify=False, cookies=self.cookies)
 
     def _put_endpoint(self, endpoint="", data={}, files=None):
         url = "{base_url}{endpoint}" \
@@ -539,12 +480,14 @@ class DigitalPaper():
         url = "{base_url}/auth/nonce/{client_id}" \
                 .format(base_url = self.base_url,
                         client_id = client_id)
-        try:
-            r = requests.get(url, verify=False)
-            return r.json()["nonce"]
-        except requests.exceptions.ConnectionError as e:
-            print('ERROR: Could not connect to DPT-RP1 under address {}'.format(self.base_url))
-            return None
+
+        r = requests.get(url, verify=False)
+        return r.json()["nonce"]
+
+    def _resolve_object_by_path(self, path):
+        enc_path = quote_plus(path)
+        url = "/resolve/entry/path/{enc_path}".format(enc_path = enc_path)
+        return self._get_endpoint(url)
 
 
 # crypto helpers
@@ -597,5 +540,3 @@ def unpad(bytestring, k=16):
         raise ValueError('Input is not padded or padding is corrupt')
     l = len(bytestring) - val
     return bytestring[:l]
-
-
